@@ -1,574 +1,266 @@
 #include "stm32f4xx_hal.h"
 #include "ST7920_parallel.h"
 #include "teclado.h"
+
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
 
-/* Defiinicion de Parametros */
+#define SEG_A (1U << 0)
+#define SEG_B (1U << 1)
+#define SEG_C (1U << 2)
+#define SEG_D (1U << 3)
+#define SEG_E (1U << 4)
+#define SEG_F (1U << 5)
+#define SEG_G (1U << 6)
 
-#define MAX_DIGITOS             4U
-#define MAX_CONTADOR            9999U
+#define SEG_PORT GPIOB
+#define SEG_A_PIN GPIO_PIN_0
+#define SEG_B_PIN GPIO_PIN_1
+#define SEG_C_PIN GPIO_PIN_2
+#define SEG_D_PIN GPIO_PIN_3
+#define SEG_E_PIN GPIO_PIN_4
+#define SEG_F_PIN GPIO_PIN_5
+#define SEG_G_PIN GPIO_PIN_6
+#define SEG_DP_PIN GPIO_PIN_7
+#define SEG_ALL_PINS (SEG_A_PIN | SEG_B_PIN | SEG_C_PIN | SEG_D_PIN | \
+                      SEG_E_PIN | SEG_F_PIN | SEG_G_PIN | SEG_DP_PIN)
 
-#define PERIODO_CONTADOR_MS     500U
-#define PERIODO_LED_MS          80U
-#define NUM_LEDS                10U
+#define DIGIT_PORT GPIOE
+#define DIGIT_1_PIN GPIO_PIN_7
+#define DIGIT_2_PIN GPIO_PIN_8
+#define DIGIT_3_PIN GPIO_PIN_9
+#define DIGIT_4_PIN GPIO_PIN_11
+#define DIGIT_ALL_PINS (DIGIT_1_PIN | DIGIT_2_PIN | DIGIT_3_PIN | DIGIT_4_PIN)
 
-#define ESTADO_NUM_A            0U
-#define ESTADO_NUM_B            1U
-#define ESTADO_LISTO            2U
-#define ESTADO_CONTEO           3U
+#define TOTAL_PASOS 8U
+#define TOTAL_DIGITOS 4U
+#define REFRESCO_MS 2U
+#define PASO_MS 250U
 
-#define MODO_A                  1U
-#define MODO_B                  2U
-#define MODO_C                  3U
-#define MODO_D                  4U
-
-
-static GPIO_TypeDef *const led_port[NUM_LEDS] =
+typedef struct
 {
-    GPIOF, GPIOE, GPIOE, GPIOF, GPIOE,
-    GPIOF, GPIOG, GPIOG, GPIOE, GPIOE
+    uint8_t digitos[TOTAL_DIGITOS];
+} paso_t;
+
+static const paso_t secuencia[TOTAL_PASOS] =
+{
+    {{SEG_A | SEG_D, SEG_A | SEG_D, 0U, 0U}},
+    {{0U, SEG_A | SEG_D, SEG_A | SEG_D, 0U}},
+    {{0U, 0U, SEG_A | SEG_D, SEG_A | SEG_D}},
+    {{0U, 0U, 0U, SEG_A | SEG_B | SEG_C | SEG_D}},
+    {{0U, 0U, 0U, SEG_B | SEG_C | SEG_G}},
+    {{0U, 0U, SEG_G, SEG_G}},
+    {{0U, SEG_G, SEG_G, 0U}},
+    {{SEG_E | SEG_F | SEG_G, 0U, 0U, 0U}}
 };
 
-static const uint16_t led_pin[NUM_LEDS] =
-{
-    GPIO_PIN_13, GPIO_PIN_9,  GPIO_PIN_11,
-    GPIO_PIN_14, GPIO_PIN_13, GPIO_PIN_15,
-    GPIO_PIN_14, GPIO_PIN_9,  GPIO_PIN_8,
-    GPIO_PIN_7
-};
+static uint8_t paso_actual = 0U;
+static uint8_t digito_actual = 0U;
+static int8_t direccion = 1;
+static uint8_t en_marcha = 1U;
+static uint8_t caso_actual = 0U;
 
-
-static uint8_t estado = ESTADO_NUM_A;
-static uint8_t modo = 0U;
-
-static uint8_t conteo_activo = 0U;
-static uint8_t pausa = 0U;
-
-static uint16_t num_a = 0U;
-static uint16_t num_b = 0U;
-static uint16_t contador = 0U;
-
-static char entrada[MAX_DIGITOS + 1U] = "";
-
-static uint32_t tiempo_contador = 0U;
-static uint32_t tiempo_led = 0U;
-
-static uint8_t secuencia_led_activa = 0U;
-static uint8_t led_actual = 0U;
-
-/* Funciones */
+static uint32_t t_refresco = 0U;
+static uint32_t t_paso = 0U;
 
 void SystemClock_Config(void);
 void MX_GPIO_Init(void);
-
-static void pantalla_linea(uint8_t fila, const char *texto);
-static void pantalla_inicial(void);
-static void pantalla_num_a(void);
-static void pantalla_num_b(void);
-static void pantalla_contador(void);
-static void pantalla_error(void);
-
-static void led_apagar_todos(void);
-static void led_encender(uint8_t posicion);
-static void iniciar_secuencia_led(uint32_t ahora);
-static void actualizar_secuencia_led(uint32_t ahora);
-
-static void iniciar_conteo(uint8_t nuevo_modo, uint32_t ahora);
-static void actualizar_contador(uint32_t ahora);
-static void cancelar_conteo(void);
-
-static void procesar_configuracion(char tecla);
-static void procesar_comando(char tecla, uint32_t ahora);
-
 
 void SysTick_Handler(void)
 {
     HAL_IncTick();
 }
 
-/* Pantalla */
-
-static void pantalla_linea(uint8_t fila, const char *texto)
+static void lcd_linea(uint8_t fila, const char *texto)
 {
     char linea[17];
-
     snprintf(linea, sizeof(linea), "%-16s", texto);
     ST7920_SendString(fila, 0U, linea);
 }
 
-static void pantalla_inicial(void)
+static void lcd_estado(void)
 {
-    ST7920_GraphicMode(0);
-    ST7920_Clear();
+    char l2[17];
+    char l3[17];
 
-    pantalla_linea(0U, "A/B/C/D INICIO");
-    pantalla_linea(1U, "CONTADOR: 0000");
-    pantalla_linea(2U, "*=PAUSA");
-    pantalla_linea(3U, "#=CANCELAR");
-}
-
-static void pantalla_num_a(void)
-{
-    ST7920_GraphicMode(0);
-    ST7920_Clear();
-
-    pantalla_linea(0U, "CONFIGURACION");
-    pantalla_linea(1U, "Ingrese NUM_A:");
-    pantalla_linea(2U, entrada);
-    pantalla_linea(3U, "#=CONFIRMAR");
-}
-
-static void pantalla_num_b(void)
-{
-    char linea[17];
+    snprintf(l2, sizeof(l2), "CASO: %u", (unsigned int)caso_actual);
+    snprintf(l3, sizeof(l3), "PASO: %u", (unsigned int)(paso_actual + 1U));
 
     ST7920_GraphicMode(0);
-    ST7920_Clear();
-
-    pantalla_linea(0U, "CONFIGURACION");
-    pantalla_linea(1U, "Ingrese NUM_B:");
-    pantalla_linea(2U, entrada);
-
-    snprintf(
-        linea,
-        sizeof(linea),
-        "A=%04u #=OK",
-        (unsigned int)num_a
-    );
-
-    pantalla_linea(3U, linea);
+    lcd_linea(0U, "1:CW 2:CCW");
+    lcd_linea(1U, "3:STOP 4:RST");
+    lcd_linea(2U, l2);
+    lcd_linea(3U, l3);
 }
 
-static void pantalla_contador(void)
+static void apagar_digitos(void)
 {
-    char linea[17];
+    HAL_GPIO_WritePin(DIGIT_PORT, DIGIT_ALL_PINS, GPIO_PIN_RESET);
+}
 
-    snprintf(
-        linea,
-        sizeof(linea),
-        "A:%04u B:%04u",
-        (unsigned int)num_a,
-        (unsigned int)num_b
-    );
+static void escribir_segmentos(uint8_t mascara)
+{
+    HAL_GPIO_WritePin(SEG_PORT, SEG_A_PIN, (mascara & SEG_A) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEG_PORT, SEG_B_PIN, (mascara & SEG_B) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEG_PORT, SEG_C_PIN, (mascara & SEG_C) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEG_PORT, SEG_D_PIN, (mascara & SEG_D) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEG_PORT, SEG_E_PIN, (mascara & SEG_E) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEG_PORT, SEG_F_PIN, (mascara & SEG_F) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEG_PORT, SEG_G_PIN, (mascara & SEG_G) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SEG_PORT, SEG_DP_PIN, GPIO_PIN_RESET);
+}
 
-    pantalla_linea(0U, linea);
+static void habilitar_digito(uint8_t indice)
+{
+    uint16_t pin = DIGIT_1_PIN;
 
-    snprintf(
-        linea,
-        sizeof(linea),
-        "CONTADOR: %04u",
-        (unsigned int)contador
-    );
-
-    pantalla_linea(1U, linea);
-
-    if (pausa != 0U)
+    if (indice == 1U)
     {
-        pantalla_linea(2U, "ESTADO: PAUSA");
+        pin = DIGIT_2_PIN;
+    }
+    else if (indice == 2U)
+    {
+        pin = DIGIT_3_PIN;
+    }
+    else if (indice == 3U)
+    {
+        pin = DIGIT_4_PIN;
+    }
+
+    HAL_GPIO_WritePin(DIGIT_PORT, pin, GPIO_PIN_SET);
+}
+
+static void refrescar_displays(void)
+{
+    uint32_t ahora = HAL_GetTick();
+
+    if ((ahora - t_refresco) < REFRESCO_MS)
+    {
+        return;
+    }
+
+    t_refresco = ahora;
+
+    apagar_digitos();
+    escribir_segmentos(secuencia[paso_actual].digitos[digito_actual]);
+    habilitar_digito(digito_actual);
+
+    digito_actual++;
+
+    if (digito_actual >= TOTAL_DIGITOS)
+    {
+        digito_actual = 0U;
+    }
+}
+
+static void avanzar_paso(void)
+{
+    uint32_t ahora = HAL_GetTick();
+
+    if (en_marcha == 0U)
+    {
+        return;
+    }
+
+    if ((ahora - t_paso) < PASO_MS)
+    {
+        return;
+    }
+
+    t_paso = ahora;
+
+    if (direccion > 0)
+    {
+        paso_actual++;
+        if (paso_actual >= TOTAL_PASOS)
+        {
+            paso_actual = 0U;
+        }
     }
     else
     {
-        if (modo == MODO_A)
+        if (paso_actual == 0U)
         {
-            pantalla_linea(2U, "MODO A: +1");
-        }
-
-        if (modo == MODO_B)
-        {
-            pantalla_linea(2U, "MODO B: -1");
-        }
-
-        if (modo == MODO_C)
-        {
-            pantalla_linea(2U, "MODO C: +2");
-        }
-
-        if (modo == MODO_D)
-        {
-            pantalla_linea(2U, "MODO D: -2");
-        }
-    }
-
-    pantalla_linea(3U, "*=PAUSA #=RESET");
-}
-
-static void pantalla_error(void)
-{
-    ST7920_GraphicMode(0);
-    ST7920_Clear();
-
-    pantalla_linea(0U, "ERROR DE DATOS");
-    pantalla_linea(1U, "NUM_A > NUM_B");
-    pantalla_linea(2U, "DATOS INVALIDOS");
-    pantalla_linea(3U, "INTENTE DE NUEVO");
-
-    HAL_Delay(1500U);
-
-    entrada[0] = '\0';
-    num_a = 0U;
-    num_b = 0U;
-    estado = ESTADO_NUM_A;
-
-    pantalla_num_a();
-}
-
-/* Barra de Leds */
-
-static void led_apagar_todos(void)
-{
-    HAL_GPIO_WritePin(GPIOF,
-                      GPIO_PIN_13 |
-                      GPIO_PIN_14 |
-                      GPIO_PIN_15,
-                      GPIO_PIN_SET);
-
-    HAL_GPIO_WritePin(GPIOE,
-                      GPIO_PIN_7  |
-                      GPIO_PIN_8  |
-                      GPIO_PIN_9  |
-                      GPIO_PIN_11 |
-                      GPIO_PIN_13,
-                      GPIO_PIN_SET);
-
-    HAL_GPIO_WritePin(GPIOG,
-                      GPIO_PIN_9 |
-                      GPIO_PIN_14,
-                      GPIO_PIN_SET);
-}
-
-static void led_encender(uint8_t posicion)
-{
-    if (posicion < NUM_LEDS)
-    {
-        HAL_GPIO_WritePin(
-            led_port[posicion],
-            led_pin[posicion],
-            GPIO_PIN_RESET
-        );
-    }
-}
-
-static void iniciar_secuencia_led(uint32_t ahora)
-{
-    secuencia_led_activa = 1U;
-    led_actual = 0U;
-    tiempo_led = ahora;
-
-    led_apagar_todos();
-    led_encender(led_actual);
-}
-
-static void actualizar_secuencia_led(uint32_t ahora)
-{
-    if (secuencia_led_activa == 0U)
-    {
-        return;
-    }
-
-    if ((ahora - tiempo_led) < PERIODO_LED_MS)
-    {
-        return;
-    }
-
-    tiempo_led = ahora;
-    led_apagar_todos();
-    led_actual++;
-
-    if (led_actual >= NUM_LEDS)
-    {
-        secuencia_led_activa = 0U;
-        led_actual = 0U;
-        led_apagar_todos();
-    }
-    else
-    {
-        led_encender(led_actual);
-    }
-}
-
-/* Contador */
-
-static void iniciar_conteo(uint8_t nuevo_modo, uint32_t ahora)
-{
-    modo = nuevo_modo;
-    conteo_activo = 1U;
-    pausa = 0U;
-    tiempo_contador = ahora;
-
-    if ((modo == MODO_A) || (modo == MODO_C))
-    {
-        contador = num_b;
-    }
-
-    if ((modo == MODO_B) || (modo == MODO_D))
-    {
-        contador = num_a;
-    }
-
-    estado = ESTADO_CONTEO;
-    pantalla_contador();
-}
-
-static void cancelar_conteo(void)
-{
-    conteo_activo = 0U;
-    pausa = 0U;
-    modo = 0U;
-    contador = 0U;
-
-    secuencia_led_activa = 0U;
-    led_apagar_todos();
-
-    estado = ESTADO_LISTO;
-    pantalla_inicial();
-}
-
-static void actualizar_contador(uint32_t ahora)
-{
-    uint16_t paso = 1U;
-    uint16_t siguiente = contador;
-    uint8_t ascendente = 0U;
-    uint8_t finalizado = 0U;
-
-    if (conteo_activo == 0U)
-    {
-        return;
-    }
-
-    if (pausa != 0U)
-    {
-        return;
-    }
-
-    if ((ahora - tiempo_contador) < PERIODO_CONTADOR_MS)
-    {
-        return;
-    }
-
-    tiempo_contador = ahora;
-
-    if ((modo == MODO_C) || (modo == MODO_D))
-    {
-        paso = 2U;
-    }
-
-    if ((modo == MODO_A) || (modo == MODO_C))
-    {
-        ascendente = 1U;
-    }
-
-    if (ascendente != 0U)
-    {
-        if (contador >= num_a)
-        {
-            siguiente = num_a;
-            finalizado = 1U;
+            paso_actual = (TOTAL_PASOS - 1U);
         }
         else
         {
-            siguiente = contador + paso;
-
-            if (siguiente >= num_a)
-            {
-                siguiente = num_a;
-                finalizado = 1U;
-            }
-        }
-    }
-    else
-    {
-        if (contador <= num_b)
-        {
-            siguiente = num_b;
-            finalizado = 1U;
-        }
-        else
-        {
-            siguiente = contador - paso;
-
-            if (siguiente <= num_b)
-            {
-                siguiente = num_b;
-                finalizado = 1U;
-            }
+            paso_actual--;
         }
     }
 
-    contador = siguiente;
-
-    if ((contador % 10U) == 0U)
-    {
-        iniciar_secuencia_led(ahora);
-    }
-
-    pantalla_contador();
-
-    if (finalizado != 0U)
-    {
-        conteo_activo = 0U;
-        pausa = 0U;
-    }
+    lcd_estado();
 }
 
-/* Configurar Teclado Input */
-
-static void procesar_configuracion(char tecla)
+static void procesar_tecla(char tecla)
 {
-    uint8_t longitud;
-
-    if (estado == ESTADO_NUM_A)
+    if ((tecla == '1') || (tecla == 'A'))
     {
-        if ((tecla >= '0') && (tecla <= '9'))
-        {
-            longitud = (uint8_t)strlen(entrada);
-
-            if (longitud < MAX_DIGITOS)
-            {
-                entrada[longitud] = tecla;
-                entrada[longitud + 1U] = '\0';
-                pantalla_num_a();
-            }
-        }
-
-        if (tecla == '*')
-        {
-            entrada[0] = '\0';
-            pantalla_num_a();
-        }
-
-        if (tecla == '#')
-        {
-            if (strlen(entrada) > 0U)
-            {
-                num_a = (uint16_t)strtoul(
-                    entrada,
-                    NULL,
-                    10
-                );
-
-                if (num_a <= MAX_CONTADOR)
-                {
-                    entrada[0] = '\0';
-                    estado = ESTADO_NUM_B;
-                    pantalla_num_b();
-                }
-                else
-                {
-                    pantalla_error();
-                }
-            }
-        }
-
+        caso_actual = 0U;
+        direccion = 1;
+        en_marcha = 1U;
+        t_paso = HAL_GetTick();
+        lcd_estado();
         return;
     }
 
-    if (estado == ESTADO_NUM_B)
+    if ((tecla == '2') || (tecla == 'B'))
     {
-        if ((tecla >= '0') && (tecla <= '9'))
-        {
-            longitud = (uint8_t)strlen(entrada);
-
-            if (longitud < MAX_DIGITOS)
-            {
-                entrada[longitud] = tecla;
-                entrada[longitud + 1U] = '\0';
-                pantalla_num_b();
-            }
-        }
-
-        if (tecla == '*')
-        {
-            entrada[0] = '\0';
-            pantalla_num_b();
-        }
-
-        if (tecla == '#')
-        {
-            if (strlen(entrada) > 0U)
-            {
-                num_b = (uint16_t)strtoul(
-                    entrada,
-                    NULL,
-                    10
-                );
-
-                if ((num_a > num_b) &&
-                    (num_b <= MAX_CONTADOR))
-                {
-                    entrada[0] = '\0';
-                    estado = ESTADO_LISTO;
-                    pantalla_inicial();
-                }
-                else
-                {
-                    pantalla_error();
-                }
-            }
-        }
-    }
-}
-
-static void procesar_comando(char tecla, uint32_t ahora)
-{
-    if (estado == ESTADO_LISTO)
-    {
-        if (tecla == 'A')
-        {
-            iniciar_conteo(MODO_A, ahora);
-        }
-
-        if (tecla == 'B')
-        {
-            iniciar_conteo(MODO_B, ahora);
-        }
-
-        if (tecla == 'C')
-        {
-            iniciar_conteo(MODO_C, ahora);
-        }
-
-        if (tecla == 'D')
-        {
-            iniciar_conteo(MODO_D, ahora);
-        }
-
-        if (tecla == '*')
-        {
-            entrada[0] = '\0';
-            num_a = 0U;
-            num_b = 0U;
-            estado = ESTADO_NUM_A;
-            pantalla_num_a();
-        }
-
+        caso_actual = 1U;
+        direccion = -1;
+        en_marcha = 1U;
+        t_paso = HAL_GetTick();
+        lcd_estado();
         return;
     }
 
-    if (estado == ESTADO_CONTEO)
+    if ((tecla == '3') || (tecla == 'C'))
     {
-        if (tecla == '*')
-        {
-            pausa = pausa == 0U ? 1U : 0U;
+        caso_actual = 2U;
+        en_marcha = 0U;
+        lcd_estado();
+        return;
+    }
 
-            if (pausa == 0U)
-            {
-                tiempo_contador = ahora;
-            }
-
-            pantalla_contador();
-        }
-
-        if (tecla == '#')
-        {
-            cancelar_conteo();
-        }
+    if ((tecla == '4') || (tecla == 'D'))
+    {
+        caso_actual = 3U;
+        paso_actual = 0U;
+        direccion = 1;
+        en_marcha = 1U;
+        t_paso = HAL_GetTick();
+        lcd_estado();
     }
 }
 
-/* GPIO */
+int main(void)
+{
+    char tecla;
+
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+
+    ST7920_Init();
+    ST7920_Clear();
+
+    apagar_digitos();
+    escribir_segmentos(0U);
+    lcd_estado();
+
+    while (1)
+    {
+        tecla = teclado();
+
+        if (tecla != '\0')
+        {
+            procesar_tecla(tecla);
+        }
+
+        avanzar_paso();
+        refrescar_displays();
+    }
+}
 
 void MX_GPIO_Init(void)
 {
@@ -579,177 +271,80 @@ void MX_GPIO_Init(void)
     __HAL_RCC_GPIOD_CLK_ENABLE();
     __HAL_RCC_GPIOE_CLK_ENABLE();
     __HAL_RCC_GPIOF_CLK_ENABLE();
-    __HAL_RCC_GPIOG_CLK_ENABLE();
 
-    /* LED de estado */
-    GPIO_InitStruct.Pin = GPIO_PIN_0;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
-
-    /* ST7920: RS, RW y E */
     GPIO_InitStruct.Pin = RS_PIN | RW_PIN | E_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
-
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* ST7920: RST, DB7, DB6, DB5 y DB4 */
     GPIO_InitStruct.Pin = RST_PIN |
                           GPIO_PIN_4 |
                           GPIO_PIN_5 |
                           GPIO_PIN_6 |
                           GPIO_PIN_7;
-
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
-
     HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-    /* Columnas del teclado */
     GPIO_InitStruct.Pin = TECLADO_COL1_PIN |
                           TECLADO_COL2_PIN |
                           TECLADO_COL3_PIN |
                           TECLADO_COL4_PIN;
-
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
     HAL_GPIO_WritePin(GPIOE, TECLADO_COL_MASK, GPIO_PIN_RESET);
 
-    /* Fila 1 del teclado */
     GPIO_InitStruct.Pin = TECLADO_ROW1_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-    /* Filas 2, 3 y 4 del teclado */
     GPIO_InitStruct.Pin = TECLADO_ROW2_PIN |
                           TECLADO_ROW3_PIN |
                           TECLADO_ROW4_PIN;
-
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-
     HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
-    /* Leds PF13, PF14 y PF15 */
-    GPIO_InitStruct.Pin = GPIO_PIN_13 |
-                          GPIO_PIN_14 |
-                          GPIO_PIN_15;
-
+    GPIO_InitStruct.Pin = SEG_ALL_PINS;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(SEG_PORT, &GPIO_InitStruct);
 
-    HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
-
-    /* Leds PE7, PE8, PE9, PE11 y PE13 */
-    GPIO_InitStruct.Pin = GPIO_PIN_7 |
-                          GPIO_PIN_8 |
-                          GPIO_PIN_9 |
-                          GPIO_PIN_11 |
-                          GPIO_PIN_13;
-
+    GPIO_InitStruct.Pin = DIGIT_ALL_PINS;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-
-    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
-
-    /* Leds PG9 y PG14 */
-    GPIO_InitStruct.Pin = GPIO_PIN_9 |
-                          GPIO_PIN_14;
-
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-
-    HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
-
-    led_apagar_todos();
+    HAL_GPIO_Init(DIGIT_PORT, &GPIO_InitStruct);
 }
-
-/* Clock */
 
 void SystemClock_Config(void)
 {
-    RCC_OscInitTypeDef osc = {0};
-    RCC_ClkInitTypeDef clk = {0};
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
     __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-    __HAL_PWR_VOLTAGESCALING_CONFIG(
-        PWR_REGULATOR_VOLTAGE_SCALE1
-    );
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+    HAL_RCC_OscConfig(&RCC_OscInitStruct);
 
-    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-    osc.HSIState = RCC_HSI_ON;
-    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    osc.PLL.PLLState = RCC_PLL_NONE;
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK |
+                                  RCC_CLOCKTYPE_SYSCLK |
+                                  RCC_CLOCKTYPE_PCLK1 |
+                                  RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-    HAL_RCC_OscConfig(&osc);
-
-    clk.ClockType = RCC_CLOCKTYPE_HCLK |
-                    RCC_CLOCKTYPE_SYSCLK |
-                    RCC_CLOCKTYPE_PCLK1 |
-                    RCC_CLOCKTYPE_PCLK2;
-
-    clk.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
-    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
-    clk.APB1CLKDivider = RCC_HCLK_DIV1;
-    clk.APB2CLKDivider = RCC_HCLK_DIV1;
-
-    HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_0);
-}
-
-/* main */
-
-int main(void)
-{
-    char tecla;
-    uint32_t ahora;
-
-    HAL_Init();
-    SystemClock_Config();
-    MX_GPIO_Init();
-
-    ST7920_Init();
-
-    pantalla_num_a();
-
-principal:
-
-    ahora = HAL_GetTick();
-    tecla = teclado();
-
-    if ((estado == ESTADO_NUM_A) ||
-        (estado == ESTADO_NUM_B))
-    {
-        procesar_configuracion(tecla);
-    }
-
-    if ((estado == ESTADO_LISTO) ||
-        (estado == ESTADO_CONTEO))
-    {
-        procesar_comando(tecla, ahora);
-    }
-
-    ahora = HAL_GetTick();
-    actualizar_contador(ahora);
-
-    ahora = HAL_GetTick();
-    actualizar_secuencia_led(ahora);
-
-    HAL_Delay(1U);
-
-    goto principal;
+    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0);
 }
