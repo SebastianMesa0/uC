@@ -26,7 +26,7 @@ void SysTick_Handler(void)
 }
 
 /*
- * Verifica si un carácter es un dígito decimal.
+ * Verifica si un carácter es un dígito decimal
  */
 static uint8_t es_digito(char caracter)
 {
